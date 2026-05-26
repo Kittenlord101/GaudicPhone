@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Gartic Phone — POC</title>
+
+<!--
+  ============================================================
+  GARTIC PHONE — MULTIPLAYER PROOF OF CONCEPT
+  ============================================================
+
+  HOW TO HOST (pick one):
+  ──────────────────────────────────────────────────────────
+  A) Local (instant, no server needed):
+     Just open this file in a browser. Other players on your
+     LAN can open it too — same Firebase DB syncs everyone.
+
+  B) GitHub Pages (free, public URL in 2 min):
+     1. Create a GitHub repo
+     2. Upload this file as index.html
+     3. Settings → Pages → Deploy from main branch
+     Done. URL: https://yourname.github.io/repo-name
+
+  C) Netlify Drop (free, instant public URL):
+     Go to https://app.netlify.com/drop
+     Drag this file into the browser window.
+     You get a URL like https://random-name.netlify.app
+
+  D) Self-hosted (Node static server):
+     npx serve .     (from the folder containing this file)
+     Then share your IP:5000 on your network.
+
+  ============================================================
+  FIREBASE SETUP (required for multiplayer sync)
+  ──────────────────────────────────────────────────────────
+  1. Go to https://console.firebase.google.com
+  2. Create a new project (free Spark plan is fine)
+  3. Add a Web App — copy the firebaseConfig object
+  4. Go to Realtime Database → Create database → Start in TEST mode
+  5. Replace the FIREBASE CONFIG block below with your config
+  6. Set Security Rules (see SECURITY RULES section below)
+
+  ============================================================
+  SECURITY RULES — paste into Firebase Console → Realtime DB → Rules
+  ──────────────────────────────────────────────────────────
+  {
+    "rules": {
+      "rooms": {
+        "$roomId": {
+          ".read": "auth == null",   // allow read without login for POC
+          ".write": "auth == null",  // tighten this once you add auth
+          "strokes": {
+            // Only allow appending strokes, not deleting others
+            "$strokeId": {
+              ".write": "!data.exists()"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  ============================================================
+  VOICE CHAT — how to add it later
+  ──────────────────────────────────────────────────────────
+  Option A — Agora (recommended for games):
+    1. npm install agora-rtc-sdk-ng  OR  use the CDN below
+    2. Get a free App ID at https://console.agora.io
+    3. Replace the stub in joinVoice() with:
+         const AgoraRTC = window.AgoraRTC;
+         const client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+         await client.join(AGORA_APP_ID, roomId, null, playerId);
+         const track = await AgoraRTC.createMicrophoneAudioTrack();
+         await client.publish(track);
+
+  Option B — Daily.co (2 lines):
+    1. Create a room at https://dashboard.daily.co
+    2. Replace joinVoice() with:
+         const call = DailyIframe.createFrame();
+         call.join({ url: 'https://yourname.daily.co/' + roomId });
+
+  Option C — Raw WebRTC + Firebase signaling (free, no 3rd party):
+    Firebase acts as the signaling channel to exchange SDP offers.
+    See: https://webrtc.org/getting-started/firebase-rtc-codelab
+
+  ============================================================
+  DATA SECURITY NOTES
+  ──────────────────────────────────────────────────────────
+  - All Firebase traffic is TLS-encrypted (HTTPS/WSS)
+  - Room IDs are 6-char random codes — hard to guess
+  - Drawing data is sent as delta strokes (not full canvas dumps)
+    so payloads stay small and can be validated server-side
+  - For production: add Firebase Auth (anonymous auth is 1 line)
+    so each player has a verified UID and rules can use auth.uid
+  - Never store sensitive data in Firebase without Auth rules
+  ============================================================
+-->
+
+<!-- ═══════════════════════════════════════════════
+     FIREBASE CONFIG — replace with your own below
+     ═══════════════════════════════════════════════ -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, set, push, onValue, onChildAdded, off, remove }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+  // ── REPLACE THIS BLOCK WITH YOUR FIREBASE CONFIG ──────────────────
+  const firebaseConfig = {
+    apiKey:            "YOUR_API_KEY",
+    authDomain:        "YOUR_PROJECT.firebaseapp.com",
+    databaseURL:       "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+    projectId:         "YOUR_PROJECT",
+    storageBucket:     "YOUR_PROJECT.appspot.com",
+    messagingSenderId: "YOUR_SENDER_ID",
+    appId:             "YOUR_APP_ID"
+  };
+  // ── END CONFIG ────────────────────────────────────────────────────
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getDatabase(app);
+
+  // ── HELPERS ──────────────────────────────────────────────────────
+  const uid = () => Math.random().toString(36).slice(2, 10);
+
+  // Expose DB API to the rest of the page
+  window._db = {
+    // Write player presence into a room
+    joinRoom(roomId, playerId, name) {
+      return set(ref(db, `rooms/${roomId}/players/${playerId}`), {
+        name, joinedAt: Date.now(), online: true
+      });
+    },
+
+    // Watch the player list
+    onPlayers(roomId, cb) {
+      const r = ref(db, `rooms/${roomId}/players`);
+      onValue(r, snap => cb(snap.val() || {}));
+      return () => off(r);
+    },
+
+    // Push a single stroke delta (x,y,color,size,type)
+    pushStroke(roomId, stroke) {
+      return push(ref(db, `rooms/${roomId}/strokes`), stroke);
+    },
+
+    // Stream new strokes as they arrive
+    onStroke(roomId, cb) {
+      const r = ref(db, `rooms/${roomId}/strokes`);
+      onChildAdded(r, snap => cb(snap.val()));
+      return () => off(r);
+    },
+
+    // Write a chat / phrase message
+    pushMessage(roomId, msg) {
+      return push(ref(db, `rooms/${roomId}/chat`), msg);
+    },
+
+    // Stream chat messages
+    onMessage(roomId, cb) {
+      const r = ref(db, `rooms/${roomId}/chat`);
+      onChildAdded(r, snap => cb(snap.val()));
+      return () => off(r);
+    },
+
+    // Write game state (whose turn, phase, etc.)
+    setGameState(roomId, state) {
+      return set(ref(db, `rooms/${roomId}/gameState`), state);
+    },
+
+    onGameState(roomId, cb) {
+      const r = ref(db, `rooms/${roomId}/gameState`);
+      onValue(r, snap => cb(snap.val()));
+      return () => off(r);
+    },
+
+    // Clear the canvas for everyone
+    clearStrokes(roomId) {
+      return remove(ref(db, `rooms/${roomId}/strokes`));
+    }
+  };
+  window._uid = uid;
+</script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Syne+Mono&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:      #0f0f11;
+  --surface: #18181c;
+  --panel:   #1f1f25;
+  --border:  rgba(255,255,255,0.08);
+  --accent:  #7DF9C2;       /* mint green */
+  --accent2: #FF6B9D;       /* pink */
+  --text:    #EEEEF0;
+  --muted:   #888890;
+  --radius:  12px;
+  --font:    'Syne', sans-serif;
+  --mono:    'Syne Mono', monospace;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── SCREENS ─────────────────────────────────────────────── */
+.screen { display: none; flex-direction: column; align-items: center;
+          justify-content: center; min-height: 100vh; padding: 24px; }
+.screen.active { display: flex; }
+
+/* ── LOBBY ───────────────────────────────────────────────── */
+#lobby { gap: 32px; }
+.logo { font-size: 48px; font-weight: 800; letter-spacing: -2px; line-height: 1; }
+.logo span { color: var(--accent); }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 28px;
+  width: 100%;
+  max-width: 400px;
+}
+.card h2 { font-size: 14px; font-weight: 600; color: var(--muted);
+           text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 16px; }
+
+.input-row { display: flex; flex-direction: column; gap: 10px; }
+input[type="text"] {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 15px;
+  padding: 11px 14px;
+  width: 100%;
+  outline: none;
+  transition: border-color 0.15s;
+}
+input[type="text"]:focus { border-color: var(--accent); }
+input[type="text"]::placeholder { color: var(--muted); }
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  gap: 8px; padding: 11px 22px; border-radius: 8px;
+  font-family: var(--font); font-size: 14px; font-weight: 700;
+  cursor: pointer; border: none; transition: transform 0.1s, opacity 0.15s;
+  width: 100%;
+}
+.btn:active { transform: scale(0.97); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-accent { background: var(--accent); color: #0f0f11; }
+.btn-accent:hover:not(:disabled) { opacity: 0.88; }
+.btn-ghost { background: transparent; color: var(--text);
+             border: 1px solid var(--border); }
+.btn-ghost:hover { background: var(--panel); }
+.btn-pink { background: var(--accent2); color: #fff; }
+.btn-pink:hover:not(:disabled) { opacity: 0.88; }
+
+.divider { display: flex; align-items: center; gap: 10px; color: var(--muted);
+           font-size: 12px; margin: 4px 0; }
+.divider::before, .divider::after { content:''; flex:1;
+  height:1px; background: var(--border); }
+
+.room-code-display {
+  font-family: var(--mono);
+  font-size: 32px;
+  font-weight: 400;
+  color: var(--accent);
+  text-align: center;
+  letter-spacing: 6px;
+  padding: 12px;
+  background: var(--panel);
+  border-radius: 8px;
+  border: 1px solid rgba(125,249,194,0.2);
+}
+
+/* ── WAITING ROOM ────────────────────────────────────────── */
+#waiting { gap: 24px; }
+.waiting-header { text-align: center; }
+.waiting-header h1 { font-size: 22px; font-weight: 700; }
+.waiting-header p  { color: var(--muted); font-size: 14px; margin-top: 4px; }
+
+.player-list {
+  width: 100%; max-width: 440px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.player-list-header {
+  padding: 12px 16px;
+  font-size: 12px; font-weight: 600;
+  color: var(--muted); text-transform: uppercase; letter-spacing: 1px;
+  border-bottom: 1px solid var(--border);
+}
+.player-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  animation: fadeIn 0.3s ease;
+}
+.player-row:last-child { border-bottom: none; }
+@keyframes fadeIn { from { opacity:0; transform: translateY(4px); } to { opacity:1; } }
+.player-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex-shrink:0; }
+.player-dot.host { background: var(--accent2); }
+.player-name-text { font-size: 15px; font-weight: 600; flex:1; }
+.badge { font-size: 10px; font-weight: 700; padding: 2px 8px;
+         border-radius: 999px; background: rgba(255,107,157,0.15);
+         color: var(--accent2); text-transform: uppercase; letter-spacing: 0.5px; }
+
+.waiting-actions { display: flex; flex-direction: column; gap: 10px; width: 100%; max-width: 440px; }
+
+/* ── GAME SCREEN ─────────────────────────────────────────── */
+#game {
+  display: none; flex-direction: row;
+  align-items: stretch; min-height: 100vh;
+  padding: 0; gap: 0;
+}
+#game.active { display: flex; }
+
+.game-sidebar {
+  width: 240px; min-width: 200px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  padding: 16px;
+  gap: 16px;
+}
+.sidebar-section { display: flex; flex-direction: column; gap: 8px; }
+.sidebar-label { font-size: 11px; font-weight: 700; color: var(--muted);
+                 text-transform: uppercase; letter-spacing: 1px; }
+
+.game-main { flex: 1; display: flex; flex-direction: column; }
+
+.game-topbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.phase-badge {
+  font-size: 12px; font-weight: 700; padding: 4px 12px;
+  border-radius: 999px; background: rgba(125,249,194,0.12);
+  color: var(--accent); text-transform: uppercase; letter-spacing: 0.5px;
+}
+.turn-text { font-size: 14px; color: var(--muted); flex: 1; }
+.timer { font-family: var(--mono); font-size: 18px; color: var(--accent); }
+
+.canvas-area { flex: 1; display: flex; align-items: center; justify-content: center;
+               padding: 16px; }
+#drawing-canvas {
+  background: #ffffff;
+  border-radius: 10px;
+  cursor: crosshair;
+  display: block;
+  max-width: 100%;
+  touch-action: none;
+}
+
+.toolbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 10px 16px; border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+.tool-btn {
+  padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+  background: transparent; color: var(--text); font-family: var(--font);
+  font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.1s;
+}
+.tool-btn.active { background: var(--accent); color: #0f0f11; border-color: var(--accent); }
+.tool-btn:hover:not(.active) { background: var(--panel); }
+
+.color-swatch {
+  width: 24px; height: 24px; border-radius: 50%;
+  border: 2px solid transparent; cursor: pointer; transition: transform 0.1s;
+}
+.color-swatch.active { border-color: #fff; transform: scale(1.25); }
+
+.size-dot { display: flex; align-items: center; justify-content: center;
+            width: 28px; height: 28px; border-radius: 6px; cursor: pointer;
+            border: 1px solid var(--border); background: transparent; transition: background 0.1s; }
+.size-dot.active { background: var(--panel); border-color: var(--accent); }
+.size-dot:hover:not(.active) { background: var(--panel); }
+
+/* ── CHAT / GUESS PANEL ──────────────────────────────────── */
+.chat-panel {
+  width: 220px; border-left: 1px solid var(--border);
+  background: var(--surface);
+  display: flex; flex-direction: column;
+}
+.chat-messages {
+  flex: 1; overflow-y: auto; padding: 12px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.chat-msg { font-size: 13px; line-height: 1.4; animation: fadeIn 0.2s ease; }
+.chat-msg .who { font-weight: 700; color: var(--accent); }
+.chat-msg .txt { color: var(--text); }
+.chat-input-row { display: flex; gap: 6px; padding: 10px; border-top: 1px solid var(--border); }
+.chat-input-row input { flex: 1; font-size: 13px; }
+.chat-send { padding: 8px 12px; border-radius: 6px; font-size: 13px; width: auto; }
+
+/* ── VOICE CHAT STUB ─────────────────────────────────────── */
+.voice-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--panel);
+  cursor: pointer; transition: border-color 0.15s;
+}
+.voice-row:hover { border-color: var(--accent); }
+.voice-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.voice-dot.live { background: var(--accent); animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+.voice-label { font-size: 12px; font-weight: 600; color: var(--muted); }
+
+/* ── STATUS MESSAGES ─────────────────────────────────────── */
+.status-msg { font-size: 13px; color: var(--muted); text-align: center;
+              padding: 6px 12px; border-radius: 6px;
+              background: var(--panel); border: 1px solid var(--border); }
+.status-msg.ok  { color: var(--accent);  border-color: rgba(125,249,194,0.2); }
+.status-msg.err { color: var(--accent2); border-color: rgba(255,107,157,0.2); }
+
+/* ── PHRASE OVERLAY ──────────────────────────────────────── */
+#phrase-overlay {
+  display: none; position: fixed; inset: 0; z-index: 100;
+  background: rgba(0,0,0,0.75); align-items: center; justify-content: center;
+}
+#phrase-overlay.show { display: flex; }
+.phrase-modal {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 32px; width: 100%; max-width: 420px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.phrase-modal h2 { font-size: 20px; font-weight: 700; }
+
+/* ── SCROLLBAR ───────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════
+     SCREEN 1: LOBBY
+══════════════════════════════════════════ -->
+<div class="screen active" id="lobby">
+  <div class="logo">gartic<span>.</span>poc</div>
+
+  <div class="card">
+    <h2>Your Name</h2>
+    <input type="text" id="player-name" placeholder="Enter your name…" maxlength="20" />
+  </div>
+
+  <div class="card" style="display:flex; flex-direction:column; gap:12px;">
+    <h2>Create a Room</h2>
+    <button class="btn btn-accent" onclick="createRoom()">Create Room</button>
+
+    <div class="divider">or</div>
+
+    <h2 style="margin-top:4px;">Join a Room</h2>
+    <input type="text" id="join-code" placeholder="6-letter room code" maxlength="6"
+           style="text-transform:uppercase; font-family: var(--mono); letter-spacing:4px;"
+           oninput="this.value=this.value.toUpperCase()" />
+    <button class="btn btn-ghost" onclick="joinRoom()">Join Room</button>
+  </div>
+
+  <div id="lobby-status" class="status-msg" style="display:none;"></div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     SCREEN 2: WAITING ROOM
+══════════════════════════════════════════ -->
+<div class="screen" id="waiting">
+  <div class="waiting-header">
+    <h1>Waiting for players</h1>
+    <p>Share the code below — everyone needs to join before starting</p>
+  </div>
+
+  <div class="card" style="max-width:440px; gap:12px; display:flex; flex-direction:column;">
+    <h2>Room Code</h2>
+    <div class="room-code-display" id="display-room-code">——</div>
+    <button class="btn btn-ghost" onclick="copyCode()" style="font-size:13px;">
+      📋 Copy Code
+    </button>
+  </div>
+
+  <div class="player-list" style="max-width:440px;">
+    <div class="player-list-header">Players in room</div>
+    <div id="player-list-body"></div>
+  </div>
+
+  <div class="waiting-actions">
+    <!-- Voice chat stub — wire up Agora/Daily here -->
+    <div class="voice-row" onclick="toggleVoice()" id="voice-row">
+      <div class="voice-dot" id="voice-dot"></div>
+      <span class="voice-label" id="voice-label">Join Voice Chat</span>
+      <span style="font-size:11px; color:var(--muted); margin-left:auto;">🎤</span>
+    </div>
+
+    <button class="btn btn-accent" id="start-btn" onclick="startGame()" disabled>
+      Start Game
+    </button>
+    <button class="btn btn-ghost" onclick="leaveRoom()" style="font-size:13px;">
+      Leave Room
+    </button>
+  </div>
+
+  <div id="waiting-status" class="status-msg" style="display:none;"></div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     SCREEN 3: GAME
+══════════════════════════════════════════ -->
+<div class="screen" id="game">
+
+  <!-- Left sidebar: players + voice -->
+  <aside class="game-sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">Players</div>
+      <div id="game-player-list" style="display:flex;flex-direction:column;gap:6px;"></div>
+    </div>
+
+    <div class="sidebar-section" style="margin-top:auto;">
+      <div class="voice-row" onclick="toggleVoice()" id="voice-row-game">
+        <div class="voice-dot" id="voice-dot-game"></div>
+        <span class="voice-label" id="voice-label-game">Voice Chat</span>
+      </div>
+      <button class="btn btn-ghost" style="font-size:12px;" onclick="leaveRoom()">Leave</button>
+    </div>
+  </aside>
+
+  <!-- Main canvas area -->
+  <main class="game-main">
+    <div class="game-topbar">
+      <span class="phase-badge" id="phase-badge">Drawing</span>
+      <span class="turn-text" id="turn-text">Waiting…</span>
+      <span class="timer" id="timer-display">—</span>
+    </div>
+
+    <div class="canvas-area">
+      <canvas id="drawing-canvas" width="600" height="400"></canvas>
+    </div>
+
+    <div class="toolbar" id="toolbar">
+      <!-- Tool -->
+      <button class="tool-btn active" id="pencil-btn" onclick="setTool('pencil')">✏ Pencil</button>
+      <button class="tool-btn" id="eraser-btn" onclick="setTool('eraser')">◻ Eraser</button>
+      <button class="tool-btn" onclick="clearMyCanvas()" style="color:var(--accent2);border-color:var(--accent2);">✕ Clear</button>
+
+      <div style="width:1px;height:24px;background:var(--border);margin:0 4px;"></div>
+
+      <!-- Sizes -->
+      <div class="size-dot active" onclick="setSize(3,this)" title="Small">
+        <div style="width:4px;height:4px;border-radius:50%;background:currentColor;"></div>
+      </div>
+      <div class="size-dot" onclick="setSize(8,this)" title="Medium">
+        <div style="width:8px;height:8px;border-radius:50%;background:currentColor;"></div>
+      </div>
+      <div class="size-dot" onclick="setSize(16,this)" title="Large">
+        <div style="width:14px;height:14px;border-radius:50%;background:currentColor;"></div>
+      </div>
+
+      <div style="width:1px;height:24px;background:var(--border);margin:0 4px;"></div>
+
+      <!-- Colors -->
+      <div class="color-swatch active" style="background:#1a1a1a;" onclick="setColor('#1a1a1a',this)"></div>
+      <div class="color-swatch" style="background:#ffffff;" onclick="setColor('#ffffff',this)"></div>
+      <div class="color-swatch" style="background:#FF6B6B;" onclick="setColor('#FF6B6B',this)"></div>
+      <div class="color-swatch" style="background:#FFD93D;" onclick="setColor('#FFD93D',this)"></div>
+      <div class="color-swatch" style="background:#6BCB77;" onclick="setColor('#6BCB77',this)"></div>
+      <div class="color-swatch" style="background:#4D96FF;" onclick="setColor('#4D96FF',this)"></div>
+      <div class="color-swatch" style="background:#C77DFF;" onclick="setColor('#C77DFF',this)"></div>
+      <div class="color-swatch" style="background:#FF9F43;" onclick="setColor('#FF9F43',this)"></div>
+    </div>
+  </main>
+
+  <!-- Right sidebar: chat / guesses -->
+  <aside class="chat-panel">
+    <div style="padding:12px;border-bottom:1px solid var(--border);">
+      <div class="sidebar-label">Guesses</div>
+    </div>
+    <div class="chat-messages" id="chat-messages"></div>
+    <div class="chat-input-row">
+      <input type="text" id="chat-input" placeholder="Type a guess…" maxlength="60"
+             onkeydown="if(event.key==='Enter')sendGuess()" />
+      <button class="btn btn-accent chat-send" onclick="sendGuess()">→</button>
+    </div>
+  </aside>
+</div>
+
+<!-- ══════════════════════════════════════════
+     PHRASE INPUT OVERLAY
+══════════════════════════════════════════ -->
+<div id="phrase-overlay">
+  <div class="phrase-modal">
+    <h2>✏ Write your phrase</h2>
+    <p style="color:var(--muted);font-size:14px;">This will be passed to the next player to draw. Keep it fun!</p>
+    <input type="text" id="phrase-input" placeholder="e.g. a wizard on a skateboard"
+           maxlength="60" />
+    <button class="btn btn-accent" onclick="submitPhrase()">Submit Phrase →</button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     GAME LOGIC
+══════════════════════════════════════════ -->
+<script type="module">
+// ── STATE ─────────────────────────────────────────────────
+let state = {
+  playerId: null,
+  playerName: null,
+  roomId: null,
+  isHost: false,
+  players: {},
+  voiceOn: false,
+  tool: 'pencil',
+  color: '#1a1a1a',
+  size: 3,
+  painting: false,
+  lastX: 0, lastY: 0,
+  unsubscribers: [],   // Firebase listeners to detach on leave
+};
+
+// ── UTILS ────────────────────────────────────────────────
+function show(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+function status(elId, msg, type = '') {
+  const el = document.getElementById(elId);
+  el.textContent = msg;
+  el.className = 'status-msg' + (type ? ' ' + type : '');
+  el.style.display = msg ? 'block' : 'none';
+}
+function genRoomCode() {
+  return Math.random().toString(36).slice(2, 8).toUpperCase();
+}
+
+// ── LOBBY ACTIONS ─────────────────────────────────────────
+window.createRoom = async function() {
+  const name = document.getElementById('player-name').value.trim();
+  if (!name) { status('lobby-status','Enter your name first','err'); return; }
+  state.playerId   = window._uid();
+  state.playerName = name;
+  state.roomId     = genRoomCode();
+  state.isHost     = true;
+  try {
+    await window._db.joinRoom(state.roomId, state.playerId, name);
+    enterWaiting();
+  } catch(e) {
+    status('lobby-status', 'Could not connect — check Firebase config', 'err');
+    console.error(e);
+  }
+};
+
+window.joinRoom = async function() {
+  const name = document.getElementById('player-name').value.trim();
+  const code = document.getElementById('join-code').value.trim().toUpperCase();
+  if (!name) { status('lobby-status','Enter your name first','err'); return; }
+  if (code.length !== 6) { status('lobby-status','Enter a 6-letter room code','err'); return; }
+  state.playerId   = window._uid();
+  state.playerName = name;
+  state.roomId     = code;
+  state.isHost     = false;
+  try {
+    await window._db.joinRoom(state.roomId, state.playerId, name);
+    enterWaiting();
+  } catch(e) {
+    status('lobby-status','Could not join — check the room code and Firebase config','err');
+    console.error(e);
+  }
+};
+
+// ── WAITING ROOM ─────────────────────────────────────────
+function enterWaiting() {
+  show('waiting');
+  document.getElementById('display-room-code').textContent = state.roomId;
+
+  const unsub = window._db.onPlayers(state.roomId, (players) => {
+    state.players = players || {};
+    renderPlayerList();
+    const count = Object.keys(state.players).length;
+    const startBtn = document.getElementById('start-btn');
+    startBtn.disabled = !state.isHost || count < 2;
+    startBtn.textContent = state.isHost
+      ? (count < 2 ? `Waiting for players… (${count}/2 min)` : `Start Game (${count} players)`)
+      : 'Waiting for host to start…';
+  });
+  state.unsubscribers.push(unsub);
+
+  // Listen for host starting game
+  const unsubGame = window._db.onGameState(state.roomId, (gs) => {
+    if (gs && gs.phase === 'drawing') enterGame();
+  });
+  state.unsubscribers.push(unsubGame);
+}
+
+function renderPlayerList() {
+  const body = document.getElementById('player-list-body');
+  body.innerHTML = '';
+  const entries = Object.entries(state.players);
+  entries.forEach(([id, p], i) => {
+    const row = document.createElement('div');
+    row.className = 'player-row';
+    row.innerHTML = `
+      <div class="player-dot ${i === 0 ? 'host' : ''}"></div>
+      <span class="player-name-text">${p.name}</span>
+      ${i === 0 ? '<span class="badge">host</span>' : ''}
+      ${id === state.playerId ? '<span style="font-size:11px;color:var(--muted);">(you)</span>' : ''}
+    `;
+    body.appendChild(row);
+  });
+}
+
+window.copyCode = function() {
+  navigator.clipboard.writeText(state.roomId).catch(()=>{});
+  status('waiting-status', `Copied! Share "${state.roomId}" with friends`, 'ok');
+  setTimeout(()=>status('waiting-status',''), 3000);
+};
+
+window.leaveRoom = function() {
+  state.unsubscribers.forEach(fn => fn());
+  state.unsubscribers = [];
+  state.roomId = null;
+  state.isHost = false;
+  show('lobby');
+};
+
+// ── VOICE CHAT STUB ───────────────────────────────────────
+// TODO: Replace body of this function with Agora / Daily / WebRTC
+// See the HOW TO ADD VOICE CHAT section in the file header comments.
+window.toggleVoice = function() {
+  state.voiceOn = !state.voiceOn;
+  const dots   = ['voice-dot','voice-dot-game'];
+  const labels = ['voice-label','voice-label-game'];
+  dots.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('live', state.voiceOn);
+  });
+  labels.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = state.voiceOn ? 'In Voice Chat' : 'Join Voice Chat';
+  });
+  if (state.voiceOn) {
+    // → wire Agora join here
+    console.log('[voice] TODO: join voice channel for room', state.roomId);
+  } else {
+    // → wire Agora leave here
+    console.log('[voice] TODO: leave voice channel');
+  }
+};
+
+// ── START GAME (host only) ────────────────────────────────
+window.startGame = async function() {
+  if (!state.isHost) return;
+  await window._db.setGameState(state.roomId, {
+    phase: 'drawing',
+    round: 1,
+    startedAt: Date.now()
+  });
+};
+
+// ── GAME SCREEN ───────────────────────────────────────────
+function enterGame() {
+  show('game');
+
+  // Render player sidebar
+  const list = document.getElementById('game-player-list');
+  list.innerHTML = '';
+  Object.entries(state.players).forEach(([id, p]) => {
+    const row = document.createElement('div');
+    row.className = 'player-row';
+    row.style.cssText = 'padding:6px 8px; border-radius:6px; border:none;';
+    row.innerHTML = `
+      <div class="player-dot" style="background:${id===state.playerId?'var(--accent2)':'var(--accent)'}"></div>
+      <span style="font-size:13px;font-weight:600;">${p.name}${id===state.playerId?' (you)':''}</span>
+    `;
+    list.appendChild(row);
+  });
+
+  initCanvas();
+  setupChatListener();
+  showPhraseOverlay();
+}
+
+// ── PHRASE ────────────────────────────────────────────────
+function showPhraseOverlay() {
+  document.getElementById('phrase-overlay').classList.add('show');
+  document.getElementById('phrase-input').focus();
+}
+
+window.submitPhrase = function() {
+  const phrase = document.getElementById('phrase-input').value.trim();
+  if (!phrase) return;
+  // In the full game, you'd send this phrase to the next player via Firebase.
+  // For the POC we just store it locally and start the drawing phase.
+  document.getElementById('phrase-overlay').classList.remove('show');
+  document.getElementById('turn-text').textContent =
+    `Drawing: "${phrase}" — others are guessing!`;
+  document.getElementById('phase-badge').textContent = 'Your turn';
+};
+
+// ── CANVAS ────────────────────────────────────────────────
+function initCanvas() {
+  const canvas = document.getElementById('drawing-canvas');
+  const ctx    = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.lineCap  = 'round';
+  ctx.lineJoin = 'round';
+
+  // Stream incoming strokes from other players
+  const unsub = window._db.onStroke(state.roomId, (stroke) => {
+    if (stroke.playerId === state.playerId) return; // already drawn locally
+    drawStroke(ctx, stroke);
+  });
+  state.unsubscribers.push(unsub);
+
+  // Mouse
+  canvas.addEventListener('mousedown',  e => startDraw(e, canvas));
+  canvas.addEventListener('mousemove',  e => continueDraw(e, canvas, ctx));
+  canvas.addEventListener('mouseup',    () => { state.painting = false; });
+  canvas.addEventListener('mouseleave', () => { state.painting = false; });
+
+  // Touch
+  canvas.addEventListener('touchstart',  e => { e.preventDefault(); startDraw(e.touches[0], canvas); }, {passive:false});
+  canvas.addEventListener('touchmove',   e => { e.preventDefault(); continueDraw(e.touches[0], canvas, ctx); }, {passive:false});
+  canvas.addEventListener('touchend',    () => { state.painting = false; });
+}
+
+function getPos(e, canvas) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) * (canvas.width  / r.width),
+    y: (e.clientY - r.top)  * (canvas.height / r.height)
+  };
+}
+
+function startDraw(e, canvas) {
+  state.painting = true;
+  const p = getPos(e, canvas);
+  state.lastX = p.x;
+  state.lastY = p.y;
+}
+
+function continueDraw(e, canvas, ctx) {
+  if (!state.painting) return;
+  const p = getPos(e, canvas);
+  const stroke = {
+    playerId: state.playerId,
+    tool:  state.tool,
+    color: state.color,
+    size:  state.size,
+    x0: state.lastX, y0: state.lastY,
+    x1: p.x,         y1: p.y
+  };
+  drawStroke(ctx, stroke);                      // draw locally immediately
+  window._db.pushStroke(state.roomId, stroke);  // push to Firebase for others
+  state.lastX = p.x;
+  state.lastY = p.y;
+}
+
+function drawStroke(ctx, s) {
+  ctx.globalCompositeOperation =
+    s.tool === 'eraser' ? 'destination-out' : 'source-over';
+  ctx.strokeStyle = s.color;
+  ctx.lineWidth   = s.size;
+  ctx.beginPath();
+  ctx.moveTo(s.x0, s.y0);
+  ctx.lineTo(s.x1, s.y1);
+  ctx.stroke();
+}
+
+window.clearMyCanvas = async function() {
+  const canvas = document.getElementById('drawing-canvas');
+  const ctx    = canvas.getContext('2d');
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await window._db.clearStrokes(state.roomId);
+};
+
+// ── DRAWING TOOLS ─────────────────────────────────────────
+window.setTool = function(tool) {
+  state.tool = tool;
+  document.getElementById('pencil-btn').classList.toggle('active', tool === 'pencil');
+  document.getElementById('eraser-btn').classList.toggle('active', tool === 'eraser');
+};
+
+window.setColor = function(c, el) {
+  state.color = c;
+  state.tool  = 'pencil';
+  document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
+  el.classList.add('active');
+  setTool('pencil');
+};
+
+window.setSize = function(s, el) {
+  state.size = s;
+  document.querySelectorAll('.size-dot').forEach(d => d.classList.remove('active'));
+  el.classList.add('active');
+};
+
+// ── CHAT / GUESSES ────────────────────────────────────────
+function setupChatListener() {
+  const unsub = window._db.onMessage(state.roomId, (msg) => {
+    const box  = document.getElementById('chat-messages');
+    const div  = document.createElement('div');
+    div.className = 'chat-msg';
+    div.innerHTML = `<span class="who">${msg.name}:</span> <span class="txt">${msg.text}</span>`;
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+  });
+  state.unsubscribers.push(unsub);
+}
+
+window.sendGuess = async function() {
+  const input = document.getElementById('chat-input');
+  const text  = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  await window._db.pushMessage(state.roomId, {
+    name: state.playerName,
+    text,
+    at: Date.now()
+  });
+};
+</script>
+</body>
+</html>
